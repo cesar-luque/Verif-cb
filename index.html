@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14181c">
+<link rel="manifest" href="manifest.json">
+<title>Verificador de códigos</title>
+<style>
+:root{--bg:#14181c;--panel:#1e252b;--text:#eef2f5;--muted:#8fa0ad;--ok:#1f9d55;--bad:#d64545;--idle:#2c3640;--accent:#f2b705}
+@media (prefers-color-scheme:light){:root{--bg:#14181c}}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{display:flex;flex-direction:column;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;gap:8px}
+header b{font-size:1rem}
+#info{font-size:.85rem;color:var(--muted)}
+#cam{position:relative;background:#000;flex:0 0 38vh;overflow:hidden}
+video{width:100%;height:100%;object-fit:cover}
+#reticle{position:absolute;inset:25% 10%;border:3px solid var(--accent);border-radius:10px;pointer-events:none;opacity:.8}
+#result{margin:10px 14px;padding:16px;border-radius:14px;background:var(--idle);text-align:center;transition:background .15s}
+#result.ok{background:var(--ok)}#result.bad{background:var(--bad)}
+#verdict{font-size:2rem;font-weight:800;margin:0}
+#code{font-size:1.1rem;margin:4px 0 0;word-break:break-all;opacity:.95}
+.row{display:flex;gap:8px;padding:0 14px 8px}
+button,input,label.btn{font:inherit;color:var(--text);background:var(--panel);border:1px solid #33404a;border-radius:10px;padding:12px;min-height:46px}
+button:focus-visible,input:focus-visible,label.btn:focus-visible{outline:3px solid var(--accent)}
+input[type=text]{flex:1;min-width:0}
+button.main{background:var(--accent);color:#14181c;font-weight:700;border:0}
+label.btn{flex:1;text-align:center;cursor:pointer}
+#log{flex:1;overflow:auto;padding:0 14px 14px;font-size:.9rem}
+#log div{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #26303a}
+#log .ok{color:#5fd68c}#log .bad{color:#ff8a8a}
+#msg{padding:0 14px 8px;font-size:.85rem;color:var(--muted);min-height:1.2em}
+</style>
+</head>
+<body>
+<header><b>Verificador de códigos</b><span id="info">Sin listado</span></header>
+<div id="cam"><video id="v" playsinline muted></video><div id="reticle"></div></div>
+<div id="result"><p id="verdict">Escaneá un código</p><p id="code">&nbsp;</p></div>
+<div id="msg"></div>
+<div class="row">
+  <button id="toggle" class="main">Iniciar cámara</button>
+  <label class="btn" tabindex="0">Cargar listado (CSV)<input id="file" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></label>
+</div>
+<div class="row">
+  <input id="manual" type="text" inputmode="numeric" placeholder="Ingresar código a mano" aria-label="Código manual">
+  <button id="check">Verificar</button>
+</div>
+<div class="row">
+  <button id="export">Exportar registro</button>
+  <button id="clear">Borrar registro</button>
+</div>
+<div id="log" aria-live="polite"></div>
+
+<script>
+(function(){
+  var codes = new Set(), log = [], stream = null, scanning = false, last = {c:'', t:0};
+  var $ = function(id){return document.getElementById(id)};
+
+  // ---- almacenamiento local (IndexedDB) ----
+  function db(){return new Promise(function(res,rej){
+    var r = indexedDB.open('escaner',1);
+    r.onupgradeneeded = function(){r.result.createObjectStore('kv')};
+    r.onsuccess = function(){res(r.result)}; r.onerror = function(){rej(r.error)};
+  })}
+  function put(k,v){return db().then(function(d){return new Promise(function(res,rej){
+    var t = d.transaction('kv','readwrite'); t.objectStore('kv').put(v,k);
+    t.oncomplete = res; t.onerror = function(){rej(t.error)};
+  })})}
+  function get(k){return db().then(function(d){return new Promise(function(res,rej){
+    var q = d.transaction('kv').objectStore('kv').get(k);
+    q.onsuccess = function(){res(q.result)}; q.onerror = function(){rej(q.error)};
+  })})}
+
+  // Quita espacios y ceros a la izquierda (UPC-A 12 dígitos = EAN-13 con 0 delante)
+  function norm(s){return String(s).trim().replace(/^"|"$/g,'').replace(/\s+/g,'').replace(/^0+(?=.)/,'')}
+  function say(t){$('msg').textContent = t}
+  function updateInfo(){$('info').textContent = codes.size ? codes.size.toLocaleString('es-AR') + ' códigos cargados' : 'Sin listado'}
+
+  // ---- carga del listado ----
+  $('file').addEventListener('change', function(e){
+    var f = e.target.files[0]; if(!f) return;
+    var rd = new FileReader();
+    rd.onload = function(){
+      var s = new Set();
+      rd.result.split(/\r?\n/).forEach(function(line){
+        var first = line.split(/[,;\t]/)[0];
+        var n = norm(first);
+        if(n) s.add(n);
+      });
+      codes = s; updateInfo();
+      put('codes', Array.from(s)).then(function(){say('Listado guardado en el teléfono. Ya funciona sin internet.')})
+        .catch(function(){say('No se pudo guardar el listado en el teléfono.')});
+    };
+    rd.readAsText(f);
+  });
+
+  // ---- verificación ----
+  function show(code, ok){
+    var r = $('result'); r.className = ok ? 'ok' : 'bad';
+    $('verdict').textContent = ok ? 'EXISTE' : 'NO EXISTE';
+    $('code').textContent = code;
+    if(navigator.vibrate) navigator.vibrate(ok ? 80 : [120,60,120]);
+    beep(ok);
+  }
+  var ac;
+  function beep(ok){
+    try{
+      ac = ac || new (window.AudioContext||window.webkitAudioContext)();
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.value = ok ? 880 : 220; g.gain.value = .15;
+      o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + (ok?.12:.3));
+    }catch(e){}
+  }
+  function verify(raw){
+    var n = norm(raw); if(!n) return;
+    if(!codes.size){say('Primero cargá el listado de códigos.'); return}
+    var ok = codes.has(n);
+    show(raw, ok);
+    log.unshift({code:raw, ok:ok, time:new Date().toISOString()});
+    if(log.length > 5000) log.pop();
+    put('log', log).catch(function(){});
+    renderLog();
+  }
+  function renderLog(){
+    var h = ''; log.slice(0,100).forEach(function(e){
+      h += '<div class="'+(e.ok?'ok':'bad')+'"><span>'+e.code.replace(/[<>&]/g,'')+'</span><span>'+(e.ok?'Existe':'No existe')+'</span></div>';
+    });
+    $('log').innerHTML = h;
+  }
+
+  $('check').addEventListener('click', function(){verify($('manual').value); $('manual').value=''});
+  $('manual').addEventListener('keydown', function(e){if(e.key==='Enter') $('check').click()});
+
+  // ---- cámara ----
+  var detector;
+  function loop(){
+    if(!scanning) return;
+    detector.detect($('v')).then(function(res){
+      if(res.length){
+        var c = res[0].rawValue, now = Date.now();
+        if(c !== last.c || now - last.t > 2000){last = {c:c, t:now}; verify(c)}
+      }
+    }).catch(function(){}).then(function(){setTimeout(loop, 120)});
+  }
+  function start(){
+    if(!('BarcodeDetector' in window)){
+      say('Este navegador no soporta lectura de códigos. Usá Chrome en Android.'); return;
+    }
+    detector = new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','qr_code']});
+    navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}}, audio:false})
+      .then(function(s){
+        stream = s; $('v').srcObject = s; $('v').play();
+        scanning = true; $('toggle').textContent = 'Detener cámara'; say(''); loop();
+      }).catch(function(){say('No se pudo abrir la cámara. Revisá el permiso en Chrome.')});
+  }
+  function stop(){
+    scanning = false;
+    if(stream) stream.getTracks().forEach(function(t){t.stop()});
+    stream = null; $('toggle').textContent = 'Iniciar cámara';
+  }
+  $('toggle').addEventListener('click', function(){scanning ? stop() : start()});
+
+  // ---- exportar / borrar ----
+  $('export').addEventListener('click', function(){
+    if(!log.length){say('El registro está vacío.'); return}
+    var csv = 'codigo,resultado,fecha\n' + log.slice().reverse().map(function(e){
+      return e.code + ',' + (e.ok?'existe':'no existe') + ',' + e.time;
+    }).join('\n');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+    a.download = 'registro-' + new Date().toISOString().slice(0,10) + '.csv';
+    a.click();
+  });
+  $('clear').addEventListener('click', function(){
+    if(confirm('¿Borrar todo el registro de escaneos?')){log = []; put('log', []); renderLog()}
+  });
+
+  // ---- arranque ----
+  get('codes').then(function(a){if(a){codes = new Set(a); updateInfo()}}).catch(function(){});
+  get('log').then(function(l){if(l){log = l; renderLog()}}).catch(function(){});
+  if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function(){});
+})();
+</script>
+</body>
+</html>
